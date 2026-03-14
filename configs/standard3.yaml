@@ -46,8 +46,8 @@ high_speed_delay_time: 0.0 # s
 low_speed_delay_time: 0.0 # s planner use this value
 
 #####-----shooter参数-----#####
-first_tolerance: 3 # 近距离射击容差，degree
-second_tolerance: 2 # 远距离射击容差，degree
+first_tolerance: 30 # 近距离射击容差，degree
+second_tolerance: 20 # 远距离射击容差，degree
 judge_distance: 2 #距离判断阈值
 auto_fire: true # 是否由自瞄控制射击
 
