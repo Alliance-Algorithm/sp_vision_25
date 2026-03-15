@@ -5,7 +5,9 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <list>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -22,9 +24,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "io/camera.hpp"
-#include "io/command.hpp"
-#include "tasks/auto_aim/aimer.hpp"
-#include "tasks/auto_aim/shooter.hpp"
+#include "tasks/auto_aim/planner/planner.hpp"
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/yolo.hpp"
@@ -36,12 +36,13 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr double kRadToDeg = 57.3;
+constexpr auto kPlannerPeriod = std::chrono::milliseconds(1);
 
-Eigen::Vector3d command_to_direction(const io::Command& command) {
+Eigen::Vector3d angles_to_direction(double yaw, double pitch) {
     Eigen::Vector3d direction{
-        std::cos(command.pitch) * std::cos(command.yaw),
-        std::cos(command.pitch) * std::sin(command.yaw),
-        -std::sin(command.pitch),
+        std::cos(pitch) * std::cos(yaw),
+        std::cos(pitch) * std::sin(yaw),
+        -std::sin(pitch),
     };
     if (direction.norm() > 1e-9)
         direction.normalize();
@@ -105,9 +106,10 @@ void draw_debug_frame(
     const std::list<auto_aim::Target>& targets,
     const auto_aim::Solver& solver,
     const auto_aim::Tracker& tracker,
-    const auto_aim::Aimer& aimer,
-    const io::Command& command,
+    const auto_aim::Plan& plan,
+    const Eigen::Vector4d& debug_xyza,
     double bullet_speed,
+    double laser_distance,
     bool fire_control) {
     auto debug_frame = source_frame.clone();
 
@@ -116,13 +118,15 @@ void draw_debug_frame(
         fmt::format(
             "[{}] control={} fire={} bullet={:.1f} yaw={:.2f} pitch={:.2f}",
             tracker.state(),
-            command.control ? 1 : 0,
+            plan.control ? 1 : 0,
             fire_control ? 1 : 0,
             bullet_speed,
-            command.yaw * kRadToDeg,
-            command.pitch * kRadToDeg),
+            plan.yaw * kRadToDeg,
+            plan.pitch * kRadToDeg),
         {10, 30},
         {255, 255, 255});
+    tools::draw_text(
+        debug_frame, fmt::format("laser={:.2f}m", laser_distance), {10, 60}, {255, 255, 255});
 
     for (const auto& armor : armors) {
         auto info = fmt::format(
@@ -143,10 +147,9 @@ void draw_debug_frame(
             tools::draw_points(debug_frame, image_points, {0, 255, 0});
         }
 
-        const auto& aim_xyza = aimer.debug_aim_point.xyza;
-        const auto image_points =
-            solver.reproject_armor(aim_xyza.head(3), aim_xyza[3], target.armor_type, target.name);
-        if (aimer.debug_aim_point.valid)
+        const auto image_points = solver.reproject_armor(
+            debug_xyza.head(3), debug_xyza[3], target.armor_type, target.name);
+        if (plan.control)
             tools::draw_points(debug_frame, image_points, {0, 0, 255});
         else
             tools::draw_points(debug_frame, image_points, {255, 0, 0});
@@ -187,12 +190,21 @@ public:
             "/gimbal/auto_aim/control_direction", control_direction_, Eigen::Vector3d::Zero());
         register_output("/gimbal/auto_aim/fire_control", fire_control_, false);
         register_output("/gimbal/auto_aim/laser_distance", laser_distance_, 0.0);
+        register_output("/gimbal/auto_aim/plan_yaw", plan_yaw_, 0.0);
+        register_output("/gimbal/auto_aim/plan_pitch", plan_pitch_, 0.0);
+        register_output("/gimbal/auto_aim/plan_yaw_velocity", plan_yaw_velocity_, 0.0);
+        register_output("/gimbal/auto_aim/plan_yaw_acceleration", plan_yaw_acceleration_, 0.0);
+        register_output("/gimbal/auto_aim/plan_pitch_velocity", plan_pitch_velocity_, 0.0);
+        register_output(
+            "/gimbal/auto_aim/plan_pitch_acceleration", plan_pitch_acceleration_, 0.0);
     }
 
     ~SpVisionBridge() override {
         stop_worker_.store(true, std::memory_order_relaxed);
         if (worker_thread_.joinable())
             worker_thread_.join();
+        if (planner_thread_.joinable())
+            planner_thread_.join();
         if (debug_)
             cv::destroyWindow("reprojection");
     }
@@ -218,6 +230,7 @@ public:
         RCLCPP_INFO(
             get_logger(), "Starting sp_vision bridge with config %s", runtime_config_path_.c_str());
         worker_thread_ = std::thread(&SpVisionBridge::worker_main, this, runtime_config_path_);
+        planner_thread_ = std::thread(&SpVisionBridge::planner_main, this, runtime_config_path_);
     }
 
     void update() override {
@@ -233,6 +246,19 @@ private:
         double laser_distance = 0.0;
         bool fire_control = false;
         bool valid = false;
+        double plan_yaw = 0.0;
+        double plan_pitch = 0.0;
+        double plan_yaw_velocity = 0.0;
+        double plan_yaw_acceleration = 0.0;
+        double plan_pitch_velocity = 0.0;
+        double plan_pitch_acceleration = 0.0;
+        Eigen::Vector4d debug_xyza = Eigen::Vector4d::Zero();
+    };
+
+    struct TargetState {
+        std::optional<auto_aim::Target> target;
+        Clock::time_point timestamp{};
+        bool ready = false;
     };
 
     Eigen::Quaterniond current_imu_pose() const {
@@ -262,6 +288,22 @@ private:
         latest_result_ = result;
     }
 
+    void store_latest_target(
+        std::optional<auto_aim::Target> target, const Clock::time_point& timestamp) {
+        std::lock_guard<std::mutex> lock(target_mutex_);
+        latest_target_.target = std::move(target);
+        latest_target_.timestamp = timestamp;
+        latest_target_.ready = true;
+    }
+
+    bool load_latest_target(TargetState& target_state) {
+        std::lock_guard<std::mutex> lock(target_mutex_);
+        if (!latest_target_.ready)
+            return false;
+        target_state = latest_target_;
+        return true;
+    }
+
     void publish_latest_result(const Clock::time_point& now) {
         VisionResult result;
         {
@@ -275,10 +317,22 @@ private:
             *control_direction_ = result.direction;
             *fire_control_ = result.fire_control;
             *laser_distance_ = result.laser_distance;
+            *plan_yaw_ = result.plan_yaw;
+            *plan_pitch_ = result.plan_pitch;
+            *plan_yaw_velocity_ = result.plan_yaw_velocity;
+            *plan_yaw_acceleration_ = result.plan_yaw_acceleration;
+            *plan_pitch_velocity_ = result.plan_pitch_velocity;
+            *plan_pitch_acceleration_ = result.plan_pitch_acceleration;
         } else {
             *control_direction_ = Eigen::Vector3d::Zero();
             *fire_control_ = false;
             *laser_distance_ = 0.0;
+            *plan_yaw_ = 0.0;
+            *plan_pitch_ = 0.0;
+            *plan_yaw_velocity_ = 0.0;
+            *plan_yaw_acceleration_ = 0.0;
+            *plan_pitch_velocity_ = 0.0;
+            *plan_pitch_acceleration_ = 0.0;
         }
     }
 
@@ -288,8 +342,6 @@ private:
             auto_aim::YOLO detector(runtime_config_path, false);
             auto_aim::Solver solver(runtime_config_path);
             auto_aim::Tracker tracker(runtime_config_path, solver);
-            auto_aim::Aimer aimer(runtime_config_path);
-            auto_aim::Shooter shooter(runtime_config_path);
 
             while (!stop_worker_.load(std::memory_order_relaxed)) {
                 cv::Mat frame;
@@ -306,40 +358,86 @@ private:
 
                 auto armors = detector.detect(frame);
                 auto targets = tracker.track(armors, frame_timestamp);
-                const double bullet_speed = bullet_speed_snapshot_.load(std::memory_order_relaxed);
-                auto command = aimer.aim(targets, frame_timestamp, bullet_speed);
-
-                VisionResult result;
-                result.timestamp = frame_timestamp;
-                result.valid = command.control;
-                result.direction =
-                    result.valid ? command_to_direction(command) : Eigen::Vector3d::Zero();
-                result.laser_distance =
-                    aimer.debug_aim_point.valid ? aimer.debug_aim_point.xyza.head<3>().norm() : 0.0;
-
-                if (result.valid) {
-                    const Eigen::Vector3d gimbal_pos =
-                        tools::eulers(solver.R_gimbal2world(), 2, 1, 0);
-                    result.fire_control = shooter.shoot(command, aimer, targets, gimbal_pos);
-                }
+                if (!targets.empty())
+                    store_latest_target(targets.front(), frame_timestamp);
+                else
+                    store_latest_target(std::nullopt, frame_timestamp);
 
                 if (debug_) {
+                    VisionResult result;
+                    {
+                        std::lock_guard<std::mutex> lock(result_mutex_);
+                        result = latest_result_;
+                    }
                     draw_debug_frame(
                         frame,
                         armors,
                         targets,
                         solver,
                         tracker,
-                        aimer,
-                        command,
-                        bullet_speed,
+                        auto_aim::Plan{
+                            result.valid,
+                            result.fire_control,
+                            static_cast<float>(result.plan_yaw),
+                            static_cast<float>(result.plan_pitch),
+                            static_cast<float>(result.plan_yaw),
+                            static_cast<float>(result.plan_yaw_velocity),
+                            static_cast<float>(result.plan_yaw_acceleration),
+                            static_cast<float>(result.plan_pitch),
+                            static_cast<float>(result.plan_pitch_velocity),
+                            static_cast<float>(result.plan_pitch_acceleration),
+                        },
+                        result.debug_xyza,
+                        bullet_speed_snapshot_.load(std::memory_order_relaxed),
+                        result.laser_distance,
                         result.fire_control);
                 }
-
-                store_result(result);
             }
         } catch (const std::exception& e) {
             RCLCPP_ERROR(get_logger(), "sp_vision bridge worker stopped: %s", e.what());
+        }
+    }
+
+    void planner_main(std::string runtime_config_path) {
+        try {
+            auto_aim::Planner planner(runtime_config_path);
+            auto next_iteration_time = Clock::now();
+
+            while (!stop_worker_.load(std::memory_order_relaxed)) {
+                next_iteration_time += kPlannerPeriod;
+
+                TargetState target_state;
+                if (!load_latest_target(target_state)) {
+                    std::this_thread::sleep_until(next_iteration_time);
+                    continue;
+                }
+
+                const double bullet_speed = bullet_speed_snapshot_.load(std::memory_order_relaxed);
+                auto plan = planner.plan(target_state.target, bullet_speed);
+
+                VisionResult result;
+                // Keep freshness tied to the last detection update so stale targets time out even
+                // when the planner keeps re-planning the same snapshot at 1 kHz.
+                result.timestamp = target_state.timestamp;
+                result.valid = plan.control;
+                result.fire_control = plan.control && plan.fire;
+                result.direction =
+                    plan.control ? angles_to_direction(plan.yaw, plan.pitch) : Eigen::Vector3d::Zero();
+                result.laser_distance =
+                    plan.control ? planner.debug_xyza.head<3>().norm() : 0.0;
+                result.plan_yaw = plan.yaw;
+                result.plan_pitch = plan.pitch;
+                result.plan_yaw_velocity = plan.yaw_vel;
+                result.plan_yaw_acceleration = plan.yaw_acc;
+                result.plan_pitch_velocity = plan.pitch_vel;
+                result.plan_pitch_acceleration = plan.pitch_acc;
+                result.debug_xyza = planner.debug_xyza;
+                store_result(result);
+
+                std::this_thread::sleep_until(next_iteration_time);
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(get_logger(), "sp_vision bridge planner stopped: %s", e.what());
         }
     }
 
@@ -350,12 +448,22 @@ private:
     OutputInterface<Eigen::Vector3d> control_direction_;
     OutputInterface<bool> fire_control_;
     OutputInterface<double> laser_distance_;
+    OutputInterface<double> plan_yaw_;
+    OutputInterface<double> plan_pitch_;
+    OutputInterface<double> plan_yaw_velocity_;
+    OutputInterface<double> plan_yaw_acceleration_;
+    OutputInterface<double> plan_pitch_velocity_;
+    OutputInterface<double> plan_pitch_acceleration_;
 
     std::thread worker_thread_;
+    std::thread planner_thread_;
     std::atomic<bool> stop_worker_{false};
 
     std::mutex result_mutex_;
     VisionResult latest_result_;
+
+    std::mutex target_mutex_;
+    TargetState latest_target_;
 
     std::mutex imu_pose_mutex_;
     Eigen::Quaterniond latest_imu_pose_ = Eigen::Quaterniond::Identity();
