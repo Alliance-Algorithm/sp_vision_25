@@ -28,6 +28,9 @@ public:
     const Armor & armor, std::chrono::steady_clock::time_point t, double radius, int armor_num,
     Eigen::VectorXd P0_dig);
   Target(double x, double vyaw, double radius, double h);
+  Target(
+    const Eigen::Vector3d & center_xyz, double angle, double vyaw, double radius,
+    double radius_delta, double height_delta);
 
   void predict(std::chrono::steady_clock::time_point t);
   void predict(double dt);

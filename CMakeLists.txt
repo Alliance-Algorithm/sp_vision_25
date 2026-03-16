@@ -42,6 +42,7 @@ add_library(
   ${PROJECT_NAME}
   SHARED
   src/sp_vision_bridge.cpp
+  src/sp_vision_response_test_bridge.cpp
   $<TARGET_OBJECTS:tools>
   $<TARGET_OBJECTS:auto_aim>
   $<TARGET_OBJECTS:omniperception>

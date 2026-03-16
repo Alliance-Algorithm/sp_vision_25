@@ -2,4 +2,7 @@
   <class
     type="sp_vision_25::bridge::SpVisionBridge"
     base_class_type="rmcs_executor::Component" />
+  <class
+    type="sp_vision_25::bridge::SpVisionResponseTestBridge"
+    base_class_type="rmcs_executor::Component" />
 </library>

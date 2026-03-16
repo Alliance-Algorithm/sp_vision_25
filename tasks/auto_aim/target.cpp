@@ -49,9 +49,30 @@ Target::Target(
   ekf_ = tools::ExtendedKalmanFilter(x0, P0, x_add);  //初始化滤波器（预测量、预测量协方差）
 }
 
-Target::Target(double x, double vyaw, double radius, double h) : armor_num_(4)
+Target::Target(double x, double vyaw, double radius, double h)
+: Target(Eigen::Vector3d{x, 0.0, 0.0}, 0.0, vyaw, radius, 0.0, h)
 {
-  Eigen::VectorXd x0{{x, 0, 0, 0, 0, 0, 0, vyaw, radius, 0, h}};
+}
+
+Target::Target(
+  const Eigen::Vector3d & center_xyz, double angle, double vyaw, double radius,
+  double radius_delta, double height_delta)
+: name(ArmorName::three),
+  armor_type(ArmorType::small),
+  priority(ArmorPriority::first),
+  jumped(false),
+  last_id(0),
+  isinit(false),
+  armor_num_(4),
+  switch_count_(0),
+  update_count_(0),
+  is_switch_(false),
+  is_converged_(false),
+  t_(std::chrono::steady_clock::now())
+{
+  Eigen::VectorXd x0{
+    {center_xyz.x(), 0, center_xyz.y(), 0, center_xyz.z(), 0, angle, vyaw, radius, radius_delta,
+     height_delta}};
   Eigen::VectorXd P0_dig{{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
   Eigen::MatrixXd P0 = P0_dig.asDiagonal();
 
