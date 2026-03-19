@@ -86,7 +86,7 @@ distort_coeffs:
 # 理想机械外参（gimbal -> camera）
 # 理想安装假设: yaw0 pitch0 roll0 degree
 R_camera2gimbal: [0, 0, 1, -1, 0, 0, 0, -1, 0]
-t_camera2gimbal: [0.11725, -0.08, 0.11670]
+t_camera2gimbal: [0.02515, 0.0, 0.07985]
 
 #####-----cboard参数-----#####
 quaternion_canid: 0x100
