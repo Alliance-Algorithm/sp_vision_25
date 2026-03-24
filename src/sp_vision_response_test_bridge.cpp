@@ -17,6 +17,7 @@
 #include <rmcs_description/tf_description.hpp>
 #include <rmcs_executor/component.hpp>
 #include <rmcs_msgs/switch.hpp>
+#include <rmcs_msgs/target_snapshot.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include "tasks/auto_aim/planner/planner.hpp"
@@ -29,19 +30,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr double kRadToDeg = 57.3;
 constexpr double kDegToRad = 1.0 / kRadToDeg;
-
-Eigen::Vector3d angles_to_direction(double yaw, double pitch) {
-    Eigen::Vector3d direction{
-        std::cos(pitch) * std::cos(yaw),
-        std::cos(pitch) * std::sin(yaw),
-        -std::sin(pitch),
-    };
-    if (direction.norm() > 1e-9)
-        direction.normalize();
-    else
-        direction.setZero();
-    return direction;
-}
 
 std::pair<double, double> yaw_pitch_from_direction(const Eigen::Vector3d& direction) {
     const double xy_norm = std::hypot(direction.x(), direction.y());
@@ -95,6 +83,23 @@ std::filesystem::path prepare_runtime_config(
     output.close();
 
     return runtime_config;
+}
+
+rmcs_msgs::TargetSnapshot
+    make_target_snapshot(auto_aim::Target target, const Clock::time_point& timestamp) {
+    rmcs_msgs::TargetSnapshot snapshot;
+    snapshot.valid = true;
+    snapshot.converged = target.convergened();
+    snapshot.armor_count = static_cast<uint8_t>(target.armor_count());
+    snapshot.armor_type = static_cast<rmcs_msgs::TargetSnapshotArmorType>(target.armor_type);
+    snapshot.armor_name = static_cast<rmcs_msgs::TargetSnapshotArmorName>(target.name);
+    snapshot.timestamp = timestamp;
+
+    const Eigen::VectorXd state = target.ekf_x();
+    for (size_t i = 0; i < snapshot.state.size() && i < static_cast<size_t>(state.size()); ++i)
+        snapshot.state[i] = state[static_cast<Eigen::Index>(i)];
+
+    return snapshot;
 }
 
 } // namespace
@@ -154,15 +159,7 @@ public:
         register_input("/referee/shooter/initial_speed", bullet_speed_, false);
 
         register_output(
-            "/gimbal/auto_aim/control_direction", control_direction_, Eigen::Vector3d::Zero());
-        register_output("/gimbal/auto_aim/fire_control", fire_control_, false);
-        register_output("/gimbal/auto_aim/laser_distance", laser_distance_, 0.0);
-        register_output("/gimbal/auto_aim/plan_yaw", plan_yaw_, 0.0);
-        register_output("/gimbal/auto_aim/plan_pitch", plan_pitch_, 0.0);
-        register_output("/gimbal/auto_aim/plan_yaw_velocity", plan_yaw_velocity_, 0.0);
-        register_output("/gimbal/auto_aim/plan_yaw_acceleration", plan_yaw_acceleration_, 0.0);
-        register_output("/gimbal/auto_aim/plan_pitch_velocity", plan_pitch_velocity_, 0.0);
-        register_output("/gimbal/auto_aim/plan_pitch_acceleration", plan_pitch_acceleration_, 0.0);
+            "/gimbal/auto_aim/target_snapshot", target_snapshot_, rmcs_msgs::TargetSnapshot{});
     }
 
     ~SpVisionResponseTestBridge() override { close_csv(); }
@@ -238,7 +235,7 @@ public:
         if (!fire_control_enabled_)
             plan.fire = false;
 
-        publish_plan(plan);
+        *target_snapshot_ = make_target_snapshot(target, *timestamp_);
         maybe_log_csv(elapsed_seconds, target, plan, bullet_speed);
     }
 
@@ -279,31 +276,6 @@ private:
         else
             vector = Eigen::Vector3d::UnitX();
         return yaw_pitch_from_direction(vector);
-    }
-
-    void publish_plan(const auto_aim::Plan& plan) {
-        if (!plan.control) {
-            *control_direction_ = Eigen::Vector3d::Zero();
-            *fire_control_ = false;
-            *laser_distance_ = 0.0;
-            *plan_yaw_ = 0.0;
-            *plan_pitch_ = 0.0;
-            *plan_yaw_velocity_ = 0.0;
-            *plan_yaw_acceleration_ = 0.0;
-            *plan_pitch_velocity_ = 0.0;
-            *plan_pitch_acceleration_ = 0.0;
-            return;
-        }
-
-        *control_direction_ = angles_to_direction(plan.yaw, plan.pitch);
-        *fire_control_ = fire_control_enabled_ && plan.fire;
-        *laser_distance_ = planner_->debug_xyza.head<3>().norm();
-        *plan_yaw_ = plan.yaw;
-        *plan_pitch_ = plan.pitch;
-        *plan_yaw_velocity_ = plan.yaw_vel;
-        *plan_yaw_acceleration_ = plan.yaw_acc;
-        *plan_pitch_velocity_ = plan.pitch_vel;
-        *plan_pitch_acceleration_ = plan.pitch_acc;
     }
 
     void open_csv() {
@@ -352,7 +324,8 @@ private:
         const auto target_state = target.ekf_x();
         const auto [actual_yaw, actual_pitch] = current_world_yaw_pitch();
         const double plan_target_yaw = plan.control ? static_cast<double>(plan.target_yaw) : 0.0;
-        const double plan_target_pitch = plan.control ? static_cast<double>(plan.target_pitch) : 0.0;
+        const double plan_target_pitch =
+            plan.control ? static_cast<double>(plan.target_pitch) : 0.0;
         const double expected_yaw = plan.control ? static_cast<double>(plan.yaw) : 0.0;
         const double expected_pitch = plan.control ? static_cast<double>(plan.pitch) : 0.0;
         const double expected_yaw_velocity = plan.control ? static_cast<double>(plan.yaw_vel) : 0.0;
@@ -391,15 +364,7 @@ private:
     InputInterface<double> pitch_velocity_imu_;
     InputInterface<float> bullet_speed_;
 
-    OutputInterface<Eigen::Vector3d> control_direction_;
-    OutputInterface<bool> fire_control_;
-    OutputInterface<double> laser_distance_;
-    OutputInterface<double> plan_yaw_;
-    OutputInterface<double> plan_pitch_;
-    OutputInterface<double> plan_yaw_velocity_;
-    OutputInterface<double> plan_yaw_acceleration_;
-    OutputInterface<double> plan_pitch_velocity_;
-    OutputInterface<double> plan_pitch_acceleration_;
+    OutputInterface<rmcs_msgs::TargetSnapshot> target_snapshot_;
 
     Clock::time_point start_time_{};
     bool start_time_initialized_ = false;
